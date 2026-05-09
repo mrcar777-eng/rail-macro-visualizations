@@ -1,0 +1,21 @@
+# Secrets — never commit
+.env
+
+# Virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE / editor local settings
+.vscode/settings.json
+.claude/
+
+# Local run scripts (contain machine-specific paths)
+visualizations/run-commands
+
+# OS artifacts
+.DS_Store
+Thumbs.db
