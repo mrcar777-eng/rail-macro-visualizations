@@ -1,0 +1,8 @@
+python-dotenv
+requests
+mysql-connector-python
+matplotlib
+pandas
+numpy
+seaborn
+scipy
