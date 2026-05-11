@@ -16,6 +16,9 @@ __pycache__/
 # Local run scripts (contain machine-specific paths)
 visualizations/run-commands
 
+# Generated map outputs
+rail_landfill_risk_map.html
+
 # OS artifacts
 .DS_Store
 Thumbs.db
