@@ -1,0 +1,289 @@
+# Implementation Plan: Extended Rail Data Pipeline
+
+## Overview
+
+Extend the existing `rail_macro_db` pipeline to ingest data from five new sources by following the established `fetch → clean → save` pattern. All changes are additive: new files in `src/`, extensions to `config.py`, `src/data_cleaner.py`, `src/database.py`, and `main.py`. No visualizations are produced.
+
+## Tasks
+
+- [x] 1. Update configuration and environment files
+  - Add `STB_APP_TOKEN = os.getenv("STB_APP_TOKEN")` and `FRA_API_TOKEN = os.getenv("FRA_API_TOKEN")` to `config.py`, following the existing `FRED_API_KEY` / `SEC_USER_AGENT` pattern
+  - Add `FAF5_CSV_URL: str` constant to `config.py` with the public FAF5 download URL as a hardcoded default
+  - Append `STB_APP_TOKEN=YOUR_STB_APP_TOKEN_HERE` and `FRA_API_TOKEN=YOUR_FRA_API_TOKEN_HERE` to `.env`
+  - Append the same two placeholder lines to `.env.example`
+  - _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5_
+
+- [x] 2. Extend `src/database.py` with 8 new table DDL statements
+  - [x] 2.1 Add `stb_waybill` and `faf5_freight_flows` DDL inside `create_tables()`
+    - `stb_waybill`: `id`, `commodity_code VARCHAR(10) NOT NULL`, `stcc_desc`, `origin_bea VARCHAR(10) NOT NULL`, `dest_bea`, `routing_miles DECIMAL(10,2)`, `car_type`, `car_loads INT`, `fetched_at`, `UNIQUE KEY uq_stb_waybill (commodity_code, origin_bea, dest_bea, car_type)`
+    - `faf5_freight_flows`: `id`, `dms_orig NOT NULL`, `dms_dest NOT NULL`, `sctg2 NOT NULL`, `dms_mode NOT NULL`, `tons DECIMAL(20,4)`, `value_usd_mil DECIMAL(20,4)`, `tmiles DECIMAL(20,4)`, `fetched_at`, `UNIQUE KEY uq_faf5 (dms_orig, dms_dest, sctg2, dms_mode)`
+    - _Requirements: 2.4, 2.5, 3.4, 3.5_
+  - [x] 2.2 Add `ncdot_rail_lines`, `ncdot_rail_crossings`, and `ncdot_rail_facilities` DDL inside `create_tables()`
+    - `ncdot_rail_lines`: `objectid INT NOT NULL`, `railroad_name`, `track_class`, `geom LINESTRING NOT NULL SRID 4326`, `fetched_at`, `UNIQUE KEY uq_ncdot_lines (objectid)`
+    - `ncdot_rail_crossings`: `crossing_id VARCHAR(50) NOT NULL`, `street_name`, `railroad_name`, `geom POINT NOT NULL SRID 4326`, `fetched_at`, `UNIQUE KEY uq_ncdot_crossings (crossing_id)`
+    - `ncdot_rail_facilities`: `objectid INT NOT NULL`, `facility_name`, `facility_type`, `railroad_name`, `geom POINT NOT NULL SRID 4326`, `fetched_at`, `UNIQUE KEY uq_ncdot_facilities (objectid)`
+    - _Requirements: 4.4, 4.5, 4.6, 4.7, 4.8, 4.9_
+  - [x] 2.3 Add `fra_grade_crossings` DDL inside `create_tables()`
+    - `fra_grade_crossings`: `crossing_id VARCHAR(20) NOT NULL`, `state_code`, `county_name`, `railroad_name`, `street_name`, `crossing_type`, `aadt INT`, `nbr_tracks INT`, `total_acc INT`, `fetched_at`, `UNIQUE KEY uq_fra_crossing (crossing_id)`
+    - _Requirements: 5.8, 5.9_
+  - [x] 2.4 Add `ncdeq_ust_facilities`, `ncdeq_ust_incidents`, and `ncdeq_active_landfills` DDL inside `create_tables()`
+    - `ncdeq_ust_facilities`: `facility_id VARCHAR(50) NOT NULL`, `facility_name`, `owner_name`, `county`, `geom POINT NOT NULL SRID 4326`, `fetched_at`, `UNIQUE KEY uq_ncdeq_ust_fac (facility_id)`
+    - `ncdeq_ust_incidents`: `incident_id VARCHAR(50) NOT NULL`, `facility_name`, `county`, `incident_date DATE`, `status`, `geom POINT NOT NULL SRID 4326`, `fetched_at`, `UNIQUE KEY uq_ncdeq_ust_inc (incident_id)`
+    - `ncdeq_active_landfills`: `objectid INT NOT NULL`, `facility_name`, `county`, `permit_number`, `geom GEOMETRY NOT NULL SRID 4326`, `fetched_at`, `UNIQUE KEY uq_ncdeq_landfill (objectid)`
+    - _Requirements: 6.4, 6.5, 6.6, 6.7, 6.8, 6.9_
+
+- [x] 3. Extend `src/data_cleaner.py` with 4 new cleaning functions
+  - [x] 3.1 Implement `clean_stb_records(records: list[dict]) -> list[dict]`
+    - Drop any record where `commodity_code` or `origin_bea` is `None` or empty string
+    - Attempt `float(record["routing_miles"])` for each record; drop the record if the coercion raises `ValueError` or `TypeError`
+    - Log the count of dropped records at INFO level, matching the existing pattern in `clean_fred_observations`
+    - _Requirements: 2.6, 2.7_
+  - [x] 3.2 Implement `clean_faf5_chunk(chunk: pd.DataFrame) -> pd.DataFrame`
+    - Drop rows where any of `dms_orig`, `dms_dest`, `sctg2`, or `dms_mode` is null
+    - Apply `pd.to_numeric(chunk[col], errors="coerce")` to `tons`, `value_usd_mil`, and `tmiles` columns, replacing non-numeric values with `NaN` (not dropping the row)
+    - _Requirements: 3.6, 3.7_
+  - [x] 3.3 Implement `clean_spatial_features(features: list[dict]) -> list[dict]`
+    - Drop any GeoJSON feature dict where `feature.get("geometry")` is `None`
+    - Drop any feature where `feature["geometry"].get("coordinates")` is an empty list or `None`
+    - Used by both NCDOT and NC DEQ save paths
+    - _Requirements: 4.10, 6.10_
+  - [x] 3.4 Implement `clean_fra_records(records: list[dict]) -> list[dict]`
+    - Drop any record where `record.get("CrossingID")` is `None` or empty string
+    - Apply `int(record[field])` coercion for `AADT`, `NbrTracks`, and `TotalAcc`; replace failures with `None` (do not drop the row)
+    - _Requirements: 5.10, 5.11_
+
+- [x] 4. Implement `src/api_stb.py` — STB Waybill SODA API fetcher
+  - [x] 4.1 Implement `_make_session() -> requests.Session`
+    - Create a `requests.Session` and mount an `HTTPAdapter` with `Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])` on both `http://` and `https://` prefixes
+    - Mirror the retry pattern described in the design's architecture section
+    - _Requirements: 2.1_
+  - [x] 4.2 Implement `fetch_waybill_records(limit: int = 50_000, offset: int = 0) -> list[dict]`
+    - Build a GET request to the STB Socrata SODA endpoint with `$limit` and `$offset` query params
+    - Set the `X-App-Token` header to `config.STB_APP_TOKEN`
+    - On HTTP error: log a warning with the status code and return `[]` without raising
+    - On success: return `response.json()` (a list of dicts)
+    - _Requirements: 2.1, 2.2, 2.3_
+  - [x] 4.3 Implement `fetch_all_waybill_records() -> list[dict]`
+    - Call `fetch_waybill_records` in a loop, advancing `offset` by `limit` each iteration
+    - Stop when the returned list is empty
+    - Return the accumulated list of all record dicts
+    - _Requirements: 2.2_
+
+- [x] 5. Implement `src/api_faf5.py` — FAF5 Freight Flow CSV fetcher
+  - [x] 5.1 Implement `_make_session() -> requests.Session`
+    - Same retry adapter pattern as `api_stb._make_session`
+    - _Requirements: 3.1_
+  - [x] 5.2 Implement `download_faf5_csv(url: str, dest_path: str) -> bool`
+    - Use `session.get(url, stream=True, timeout=120)` and write `response.iter_content(chunk_size=8192)` to `dest_path`
+    - Return `True` on success; on HTTP error log a warning and return `False`
+    - _Requirements: 3.1, 3.10_
+  - [x] 5.3 Implement `iter_faf5_chunks(dest_path: str, chunksize: int = 100_000) -> Iterator[pd.DataFrame]`
+    - Use `pd.read_csv(dest_path, chunksize=chunksize, dtype=str)` and `yield` each chunk
+    - Using `dtype=str` prevents pandas from silently coercing mixed-type columns before the cleaner runs
+    - _Requirements: 3.2, 3.3_
+
+- [x] 6. Implement `src/api_ncdot.py` — NCDOT ArcGIS REST fetcher
+  - [x] 6.1 Define `_LAYERS: dict[str, str]` mapping layer names to ArcGIS REST query URLs
+    - Keys: `"rail_lines"`, `"rail_crossings"`, `"rail_facilities"`
+    - Values: the respective NCDOT ArcGIS REST `/query` endpoint URLs
+    - _Requirements: 4.1_
+  - [x] 6.2 Implement `_make_session() -> requests.Session`
+    - Same retry adapter pattern as other fetcher modules
+    - _Requirements: 4.1_
+  - [x] 6.3 Implement `fetch_layer(url: str, layer_name: str, max_record_count: int = 1_000) -> list[dict]`
+    - Implement the ArcGIS REST pagination loop from the design's "Key Algorithms" section
+    - Request params: `f=geojson`, `outFields=*`, `where=1=1`, `resultOffset=N`, `resultRecordCount=max_record_count`
+    - Stop when `exceededTransferLimit` is absent/False **or** `len(features) < max_record_count`
+    - On HTTP error or `"error"` key in JSON response: log a warning and return `[]`
+    - _Requirements: 4.2, 4.3_
+  - [x] 6.4 Implement `fetch_all_layers() -> dict[str, list[dict]]`
+    - Call `fetch_layer` for each entry in `_LAYERS`
+    - Return a dict mapping layer name to list of GeoJSON feature dicts
+    - _Requirements: 4.1_
+
+- [x] 7. Implement `src/api_fra.py` — FRA Grade Crossing OData fetcher
+  - [x] 7.1 Define `_TokenState` dataclass with fields `token: str` and `acquired_at: datetime`
+    - _Requirements: 5.1_
+  - [x] 7.2 Implement `_acquire_token() -> _TokenState`
+    - POST to the FRA token endpoint using `config.FRA_API_TOKEN` as the credential
+    - Record `datetime.utcnow()` as `acquired_at`
+    - Raise on HTTP error (caller handles)
+    - _Requirements: 5.1_
+  - [x] 7.3 Implement `_token_needs_refresh(state: _TokenState, refresh_before_seconds: int = 120) -> bool`
+    - Return `True` if `(datetime.utcnow() - state.acquired_at).total_seconds() >= 1080`
+    - The threshold 1080 = 1200s (20-minute expiry) − 120s (2-minute buffer)
+    - _Requirements: 5.2_
+  - [x] 7.4 Implement `fetch_all_crossings(page_size: int = 1_000) -> list[dict]`
+    - Implement the FRA token-refresh pagination loop from the design's "Key Algorithms" section
+    - Call `_acquire_token()` before the first page; call `_token_needs_refresh()` before each page
+    - Use `$skip` and `$top` OData query params; set `Authorization: Bearer state.token` header
+    - On HTTP 401: refresh token once and retry the same page; if still failing, log and break
+    - On other HTTP error: log warning and break, returning records collected so far
+    - Stop when `response.json()["value"]` is empty
+    - _Requirements: 5.1, 5.2, 5.3, 5.4, 5.5, 5.6, 5.7_
+
+- [x] 8. Implement `src/api_ncdeq.py` — NC DEQ ArcGIS REST fetcher
+  - [x] 8.1 Define `_LAYERS: dict[str, str]` mapping layer names to NC DEQ ArcGIS REST query URLs
+    - Keys: `"ust_facilities"`, `"ust_incidents"`, `"active_landfills"`
+    - Values: the respective NC DEQ ArcGIS REST `/query` endpoint URLs
+    - _Requirements: 6.1_
+  - [x] 8.2 Implement `_make_session() -> requests.Session`
+    - Same retry adapter pattern as other fetcher modules
+    - _Requirements: 6.1_
+  - [x] 8.3 Implement `fetch_layer(url: str, layer_name: str, max_record_count: int = 1_000) -> list[dict]`
+    - Identical pagination algorithm to `api_ncdot.fetch_layer`
+    - On HTTP error or `"error"` key in JSON response: log a warning and return `[]`
+    - _Requirements: 6.2, 6.3_
+  - [x] 8.4 Implement `fetch_all_layers() -> dict[str, list[dict]]`
+    - Call `fetch_layer` for each entry in `_LAYERS`
+    - Return a dict mapping layer name to list of GeoJSON feature dicts
+    - _Requirements: 6.1_
+
+- [x] 9. Extend `src/database.py` with 5 new save functions
+  - [x] 9.1 Implement `save_stb_waybill(records: list[dict]) -> int`
+    - Build rows as `(commodity_code, stcc_desc, origin_bea, dest_bea, routing_miles, car_type, car_loads)` tuples
+    - Use `cursor.executemany` with `INSERT IGNORE INTO stb_waybill (...) VALUES (%s, %s, %s, %s, %s, %s, %s)`
+    - Return `cursor.rowcount`; on `Error` log and rollback, return `0`
+    - Mirror the structure of `save_fred_data` and `save_edgar_filings`
+    - _Requirements: 2.8, 2.9_
+  - [x] 9.2 Implement `save_faf5_chunk(chunk: pd.DataFrame) -> int`
+    - Convert the cleaned DataFrame to a list of tuples `(dms_orig, dms_dest, sctg2, dms_mode, tons, value_usd_mil, tmiles)`
+    - Replace `NaN` values with `None` before building tuples (use `chunk.where(pd.notna(chunk), None)`)
+    - Use `cursor.executemany` with `INSERT IGNORE INTO faf5_freight_flows (...) VALUES (%s, %s, %s, %s, %s, %s, %s)`
+    - Return `cursor.rowcount`
+    - _Requirements: 3.8, 3.9_
+  - [x] 9.3 Implement `save_ncdot_layer(layer_name: str, features: list[dict]) -> int`
+    - Dispatch on `layer_name` (`"rail_lines"`, `"rail_crossings"`, `"rail_facilities"`) to select the target table and column mapping
+    - For each feature, extract `properties` fields and serialize `feature["geometry"]` with `json.dumps`
+    - Use the spatial insert pattern: `ST_GeomFromText(ST_AsText(ST_GeomFromGeoJSON(%s)), 4326)` for the geometry placeholder
+    - Use `INSERT IGNORE` and return `cursor.rowcount`
+    - _Requirements: 4.11, 4.12_
+  - [x] 9.4 Implement `save_ncdeq_layer(layer_name: str, features: list[dict]) -> int`
+    - Dispatch on `layer_name` (`"ust_facilities"`, `"ust_incidents"`, `"active_landfills"`) to select the target table and column mapping
+    - Same spatial insert pattern as `save_ncdot_layer`
+    - Use `INSERT IGNORE` and return `cursor.rowcount`
+    - _Requirements: 6.11, 6.12_
+  - [x] 9.5 Implement `save_fra_crossings(records: list[dict]) -> int`
+    - Build rows as `(crossing_id, state_code, county_name, railroad_name, street_name, crossing_type, aadt, nbr_tracks, total_acc)` tuples
+    - Use `cursor.executemany` with `INSERT IGNORE INTO fra_grade_crossings (...) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)`
+    - Return `cursor.rowcount`; on `Error` log and rollback, return `0`
+    - _Requirements: 5.12, 5.13_
+
+- [x] 10. Integrate all 5 new steps into `main.py`
+  - [x] 10.1 Add imports for all new modules and functions at the top of `main.py`
+    - Import `fetch_all_waybill_records` from `src.api_stb`
+    - Import `download_faf5_csv`, `iter_faf5_chunks` from `src.api_faf5`
+    - Import `fetch_all_layers as fetch_ncdot_layers` from `src.api_ncdot`
+    - Import `fetch_all_crossings` from `src.api_fra`
+    - Import `fetch_all_layers as fetch_ncdeq_layers` from `src.api_ncdeq`
+    - Import `clean_stb_records`, `clean_faf5_chunk`, `clean_spatial_features`, `clean_fra_records` from `src.data_cleaner`
+    - Import `save_stb_waybill`, `save_faf5_chunk`, `save_ncdot_layer`, `save_fra_crossings`, `save_ncdeq_layer` from `src.database`
+    - _Requirements: 7.1_
+  - [x] 10.2 Add STB Waybill step to `run_pipeline()` after the existing Edgar step
+    - Wrap in `try/except Exception` matching the pattern described in Requirement 7.3
+    - Call `fetch_all_waybill_records()`, then `clean_stb_records()`, then `save_stb_waybill()`
+    - Log step name and inserted count: `logger.info("[3/7] STB Waybill: %d new rows saved", count)`
+    - _Requirements: 7.1, 7.2, 7.3, 7.4_
+  - [x] 10.3 Add FAF5 Freight Flow step to `run_pipeline()` after the STB step
+    - Wrap in `try/except Exception`
+    - Use `tempfile.NamedTemporaryFile(suffix=".csv", delete=False)` for the download destination
+    - Call `download_faf5_csv(config.FAF5_CSV_URL, tmp_path)`; if it returns `False`, skip to next step
+    - Loop over `iter_faf5_chunks(tmp_path)`, calling `clean_faf5_chunk` then `save_faf5_chunk` per chunk; accumulate total count
+    - Delete the temp file in a `finally` block
+    - Log step name and total inserted count
+    - _Requirements: 7.1, 7.2, 7.3, 7.4_
+  - [x] 10.4 Add NCDOT Rail Infrastructure step to `run_pipeline()` after the FAF5 step
+    - Wrap in `try/except Exception`
+    - Call `fetch_ncdot_layers()`, then for each layer call `clean_spatial_features()` then `save_ncdot_layer(layer_name, features)`; accumulate total count
+    - Log step name and total inserted count
+    - _Requirements: 7.1, 7.2, 7.3, 7.4_
+  - [x] 10.5 Add FRA Grade Crossings step to `run_pipeline()` after the NCDOT step
+    - Wrap in `try/except Exception`
+    - Call `fetch_all_crossings()`, then `clean_fra_records()`, then `save_fra_crossings()`
+    - Log step name and inserted count
+    - _Requirements: 7.1, 7.2, 7.3, 7.4_
+  - [x] 10.6 Add NC DEQ Environmental step to `run_pipeline()` after the FRA step
+    - Wrap in `try/except Exception`
+    - Call `fetch_ncdeq_layers()`, then for each layer call `clean_spatial_features()` then `save_ncdeq_layer(layer_name, features)`; accumulate total count
+    - Log step name and total inserted count
+    - _Requirements: 7.1, 7.2, 7.3, 7.4_
+  - [x] 10.7 Update the final log message and step counter labels
+    - Change the final `logger.info("Pipeline complete.")` to remain as-is (Requirement 7.6)
+    - Update step labels to `[1/7]` through `[7/7]` to reflect the two existing plus five new steps
+    - _Requirements: 7.5, 7.6_
+
+- [x] 11. Checkpoint — verify tables, cleaners, and pipeline wiring
+  - Ensure all 8 new tables are created by `create_tables()` without error
+  - Ensure all 4 new cleaner functions handle empty input without raising
+  - Ensure `run_pipeline()` calls all 7 steps in order and logs "Pipeline complete."
+  - Ensure all tests pass, ask the user if questions arise.
+
+- [ ] 12. Write property-based tests using Hypothesis
+  - [ ] 12.1 Write property test for config credential round-trip
+    - `@given(st.text(min_size=1))` — set `STB_APP_TOKEN` env var, reload config module, assert `config.STB_APP_TOKEN` equals the set value
+    - **Property 1: Config credential round-trip**
+    - **Validates: Requirements 1.5**
+  - [ ]* 12.2 Write property test for STB JSON parse round-trip
+    - `@given(st.lists(st.fixed_dictionaries({...})))` — mock SODA response with a JSON array, assert `fetch_waybill_records()` returns equivalent dicts
+    - **Property 2: STB JSON parse round-trip**
+    - **Validates: Requirements 2.2**
+  - [ ]* 12.3 Write property test for null-key record filtering (STB, FAF5, FRA)
+    - `@given(st.lists(...))` with strategy generating records mixing null/empty and valid key fields
+    - Assert cleaner output contains no records with null/empty required keys, and all valid-key records are retained
+    - **Property 3: Null-key record filtering**
+    - **Validates: Requirements 2.6, 3.6, 5.10**
+  - [ ]* 12.4 Write property test for STB numeric coercion — drop on failure
+    - `@given(st.one_of(st.floats(allow_nan=False), st.text()))` for `routing_miles`
+    - Assert records with non-numeric `routing_miles` are dropped; records with valid floats are retained
+    - **Property 4: Numeric coercion — drop on failure (STB routing miles)**
+    - **Validates: Requirements 2.7**
+  - [ ]* 12.5 Write property test for FAF5/FRA numeric coercion — retain with NULL on failure
+    - `@given(st.data_frames(...))` for FAF5 chunks; `@given(st.lists(...))` for FRA records
+    - Assert non-numeric metric values become `NaN`/`None` but the row/record is retained
+    - **Property 5: Numeric coercion — retain with NULL on failure (FAF5 and FRA)**
+    - **Validates: Requirements 3.7, 5.11**
+  - [ ]* 12.6 Write property test for spatial geometry filtering
+    - `@given(st.lists(geojson_feature_strategy()))` where the strategy generates features with random valid/null/empty geometry
+    - Assert `clean_spatial_features()` drops all null/empty-geometry features and retains all valid ones
+    - **Property 6: Spatial geometry filtering**
+    - **Validates: Requirements 4.10, 6.10**
+  - [ ]* 12.7 Write property test for ArcGIS pagination completeness
+    - `@given(st.lists(st.integers(min_value=1, max_value=1_000), min_size=1))` for page sizes
+    - Mock ArcGIS responses with `exceededTransferLimit: true` on all but the last page; assert total accumulated features equals sum of all page sizes
+    - **Property 7: ArcGIS pagination completeness**
+    - **Validates: Requirements 4.2, 6.2**
+  - [ ]* 12.8 Write property test for INSERT IGNORE idempotence
+    - `@given(valid_record_strategy())` — insert a record, insert the same record again, assert row count in table is unchanged and second save returns `0`
+    - Use a mocked `executemany` cursor to avoid requiring a live MySQL instance
+    - **Property 8: INSERT IGNORE idempotence**
+    - **Validates: Requirements 2.5, 2.8, 3.5, 3.8, 4.7, 4.8, 4.9, 4.12, 5.9, 5.12, 6.7, 6.8, 6.9, 6.12**
+  - [ ]* 12.9 Write property test for save function row count accuracy
+    - `@given(st.lists(valid_record_strategy(), min_size=1))` — pass N unique records to `save_stb_waybill` / `save_fra_crossings` with a mocked cursor; assert return value equals N on first call and 0 on second call
+    - **Property 9: Save function row count accuracy**
+    - **Validates: Requirements 2.9, 5.13**
+  - [ ]* 12.10 Write property test for FRA token refresh timing
+    - `@given(st.timedeltas(min_value=timedelta(0), max_value=timedelta(seconds=1300)))` — construct a `_TokenState` with `acquired_at = utcnow() - delta`; assert `_token_needs_refresh()` returns `True` iff `delta.total_seconds() >= 1080`
+    - **Property 10: FRA token refresh timing**
+    - **Validates: Requirements 5.2**
+  - [ ]* 12.11 Write property test for FRA pagination accumulation
+    - `@given(st.lists(st.integers(min_value=0, max_value=500), min_size=1))` for page sizes (last page is empty)
+    - Mock FRA OData responses; assert `fetch_all_crossings()` returns a list whose length equals the sum of all non-empty page sizes
+    - **Property 11: FRA pagination accumulation**
+    - **Validates: Requirements 5.3, 5.4, 5.5**
+  - [ ]* 12.12 Write property test for pipeline step resilience
+    - `@given(st.integers(min_value=0, max_value=6))` for the index of the step that raises
+    - Patch all 7 pipeline steps; make one raise `Exception`; assert all subsequent steps are still called
+    - **Property 12: Pipeline step resilience**
+    - **Validates: Requirements 7.3**
+
+- [ ] 13. Final checkpoint — full pipeline verification
+  - Ensure all tests pass, ask the user if questions arise.
+
+## Notes
+
+- Sub-tasks marked with `*` are optional and can be skipped for a faster MVP
+- Each task references specific requirements for traceability
+- The spatial insert pattern `ST_GeomFromText(ST_AsText(ST_GeomFromGeoJSON(%s)), 4326)` is used in all spatial save functions — no additional Python spatial library is needed
+- Property tests use [Hypothesis](https://hypothesis.readthedocs.io/) with a minimum of 100 iterations per property
+- All new fetcher modules use a shared `HTTPAdapter` retry strategy (3 retries, exponential backoff, status codes 429/500/502/503/504)
+- `dtype=str` in `pd.read_csv` prevents silent coercion before the cleaner runs; the cleaner applies `pd.to_numeric(..., errors="coerce")` explicitly

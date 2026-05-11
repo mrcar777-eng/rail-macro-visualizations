@@ -20,6 +20,10 @@ TARGET_RAIL_COMPANIES = {
 
 FRED_API_KEY    = os.getenv("FRED_API_KEY")
 SEC_USER_AGENT  = os.getenv("SEC_USER_AGENT")
+STB_APP_TOKEN   = os.getenv("STB_APP_TOKEN")
+FRA_USERNAME    = os.getenv("FRA_USERNAME")   # FRA SecureApi account username
+FRA_PASSWORD    = os.getenv("FRA_PASSWORD")   # FRA SecureApi account password
+FAF5_CSV_URL    = os.getenv("FAF5_CSV_URL", "https://faf.ornl.gov/faf5/data/download_files/FAF5.7.1_2017-2024.zip")
 
 DB_HOST     = os.getenv("DB_HOST", "localhost")
 DB_USER     = os.getenv("DB_USER", "root")
